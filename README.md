@@ -4,8 +4,6 @@ A fully reproducible pipeline that predicts ATP match winners from four feature 
 
 The model beats an Elo-only baseline by a small but statistically robust margin (+1.6 accuracy points, 95% CI excludes zero, stable across 4 independent test periods 2022–2025). It finds **no evidence of a profitable betting edge** against Pinnacle closing odds on this dataset (holdout ROI ≈ −3.7%, p = 1.00). Both results are reported as-is - this project is a methodology exercise, not a betting system.
 
-
-
 ## Motivation
 
 ATP rankings are a noisy, slow-reacting signal of player strength. This project builds a more reactive, surface-specific alternative (Elo per surface) and combines it with recent-form, fatigue, and head-to-head features, then asks two separate questions:
