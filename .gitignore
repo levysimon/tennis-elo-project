@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+tennis_env/
+.vscode/
+.DS_Store
+
+# Données brutes et lourdes (optionnel : commentez si vous voulez les versionner)
+data/raw/*
+data/processed/*
+
+# Résultats et graphiques générés
+outputs/*
