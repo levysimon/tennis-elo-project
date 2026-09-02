@@ -2,7 +2,7 @@
 
 A fully reproducible pipeline that predicts ATP match winners from four feature families (surface-specific Elo, serve/return efficiency, fatigue/recent form, head-to-head confrontation), and rigorously tests whether that predictive edge translates into a betting edge against closing odds.
 
-The model beats an Elo-only baseline by a small but statistically robust margin (+1.6 accuracy points, 95% CI excludes zero, stable across 4 independent test periods 2022–2025). It finds **no evidence of a profitable betting edge** against Pinnacle closing odds on this dataset (holdout ROI ≈ −3.7%, p = 1.00). Both results are reported as-is - this project is a methodology exercise, not a betting system.
+The model outperforms an Elo-only baseline by +3.63 percentage points in mean accuracy, with a bootstrap 95% CI of [+3.39, +3.81], consistently across four independent walk-forward test periods from 2022 to 2025. Mean log-loss also improves by 0.0396 (95% CI [+0.0381, +0.0409]). However, this predictive advantage does not translate into a statistically defensible betting edge against Pinnacle closing odds on this dataset: the frozen holdout strategy produces a −0.12% ROI (95% CI [−8.19%, +8.43%], permutation p = 1.00). Both results are reported as-is — this project is a methodology exercise, not a betting system
 
 ## Motivation
 
