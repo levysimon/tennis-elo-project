@@ -199,6 +199,10 @@ def symmetrize_row(row: dict, player1_is_winner: bool) -> dict:
     out["player1_faces_lefty"] = (1 if p2_hand == "L" else 0) if p2_hand in ("L", "R") else ""
     out["player2_faces_lefty"] = (1 if p1_hand == "L" else 0) if p1_hand in ("L", "R") else ""
 
+    surface_raw = str(out.get("surface_norm") or out.get("surface") or "").strip()
+    for surf_name in ("Hard", "Clay", "Grass", "Carpet"):
+        out[f"surface_{surf_name}"] = 1 if surface_raw == surf_name else 0
+
     return out
 
 
