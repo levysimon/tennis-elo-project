@@ -294,6 +294,31 @@ def main():
         print("🟡 L'IC du gain d'accuracy inclut 0 : le gain n'est pas garanti stable sur toutes les périodes — "
               "regarder le détail par origine ci-dessus avant de conclure.")
 
+    print("\n=== Stabilité du gain (modèle complet - Classement ATP brut) à travers les origines ===")
+    acc_diffs_rank = [r["full"]["accuracy"] - r["rank"]["accuracy"] for r in per_origin_results if r["rank"]]
+    logloss_diffs_rank = [r["rank"]["log_loss"] - r["full"]["log_loss"] for r in per_origin_results if r["rank"]]
+
+    acc_mean_rank, acc_lo_rank, acc_hi_rank = bootstrap_ci_on_diffs(acc_diffs_rank)
+    ll_mean_rank, ll_lo_rank, ll_hi_rank = bootstrap_ci_on_diffs(logloss_diffs_rank)
+
+    print(f"Gain d'accuracy moyen (modèle - Rang ATP) : {acc_mean_rank:+.4f}  |  IC bootstrap 95% : "
+          f"[{acc_lo_rank:+.4f} ; {acc_hi_rank:+.4f}]")
+    print(f"Gain de log-loss moyen (Rang ATP - modèle, positif = mieux) : {ll_mean_rank:+.4f}  |  IC bootstrap 95% : "
+          f"[{ll_lo_rank:+.4f} ; {ll_hi_rank:+.4f}]")
+    if acc_lo_rank > 0:
+        print("🟢 Le gain d'accuracy du modèle complet sur le rang ATP brut semble robuste à travers les périodes testées.")
+    else:
+        print("🟡 L'IC du gain d'accuracy vs rang ATP inclut 0 : le gain n'est pas garanti stable sur toutes les périodes.")
+
+    # Comparaison directe des deux baselines entre elles : le rang ATP
+    # brut est-il seulement redondant avec l'Elo, ou apporte-t-il quelque
+    # chose de différent ? (informatif, pas utilisé pour juger le modèle)
+    elo_vs_rank_acc = [r["elo"]["accuracy"] - r["rank"]["accuracy"] for r in per_origin_results if r["elo"] and r["rank"]]
+    if elo_vs_rank_acc:
+        evr_mean, evr_lo, evr_hi = bootstrap_ci_on_diffs(elo_vs_rank_acc)
+        print(f"\nPour référence — écart d'accuracy Elo vs Rang ATP brut (indépendamment du modèle complet) : "
+              f"{evr_mean:+.4f}  |  IC bootstrap 95% : [{evr_lo:+.4f} ; {evr_hi:+.4f}]")
+
     # Importance des features sur le dernier modèle entraîné (origine la plus récente)
     last_train = df[df["tourney_date"] < TEST_ORIGINS[-1]]
     last_test = df[(df["tourney_date"] >= TEST_ORIGINS[-1]) & (df["tourney_date"] <= TEST_WINDOW_END)]
@@ -310,14 +335,20 @@ def main():
                "accuracy_full": r["full"]["accuracy"], "log_loss_full": r["full"]["log_loss"]}
         if r["elo"]:
             row.update({"accuracy_elo": r["elo"]["accuracy"], "log_loss_elo": r["elo"]["log_loss"]})
+        if r["rank"]:
+            row.update({"accuracy_rank_atp": r["rank"]["accuracy"], "log_loss_rank_atp": r["rank"]["log_loss"]})
         summary_rows.append(row)
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(OUTPUTS_DIR / "walkforward_summary.csv", index=False)
 
     with open(OUTPUTS_DIR / "walkforward_summary.txt", "w") as f:
         f.write(summary_df.to_string(index=False))
-        f.write(f"\n\nGain accuracy moyen : {acc_mean:+.4f}, IC95%: [{acc_lo:+.4f}; {acc_hi:+.4f}]\n")
+        f.write(f"\n\n--- vs baseline Elo ---\n")
+        f.write(f"Gain accuracy moyen : {acc_mean:+.4f}, IC95%: [{acc_lo:+.4f}; {acc_hi:+.4f}]\n")
         f.write(f"Gain log-loss moyen : {ll_mean:+.4f}, IC95%: [{ll_lo:+.4f}; {ll_hi:+.4f}]\n")
+        f.write(f"\n--- vs baseline Classement ATP brut ---\n")
+        f.write(f"Gain accuracy moyen : {acc_mean_rank:+.4f}, IC95%: [{acc_lo_rank:+.4f}; {acc_hi_rank:+.4f}]\n")
+        f.write(f"Gain log-loss moyen : {ll_mean_rank:+.4f}, IC95%: [{ll_lo_rank:+.4f}; {ll_hi_rank:+.4f}]\n")
 
     print(f"\n✅ Résumé écrit dans {OUTPUTS_DIR / 'walkforward_summary.txt'} "
           f"et {OUTPUTS_DIR / 'walkforward_summary.csv'}")
