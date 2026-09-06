@@ -8,6 +8,17 @@ CHANGEMENTS PAR RAPPORT A LA V2 :
    dès que le modèle détecte une espérance de gain positive (EV > 0).
 2. Simplification des fonctions de calcul de rentabilité (profitComputation, bootstrap, etc.) 
    qui utilisent désormais nativement cette mise fixe.
+
+CHANGEMENTS PAR RAPPORT A LA V3 (ce fichier) :
+3. Remplacement de l'exclusion par PRÉFIXE (startswith) des colonnes de cotes par une
+   exclusion par NOM EXACT. L'ancienne approche (ODDS_LEAKAGE_PREFIXES avec des chaînes
+   courtes comme 'player1_ps', 'player1_avg', 'player1_max') fonctionnait correctement
+   avec les colonnes actuelles, MAIS était fragile : toute future feature nommée
+   'player1_avg_XXX' ou 'player1_max_XXX' aurait été silencieusement exclue du modèle
+   sans aucun avertissement, alors qu'elle n'a rien à voir avec les cotes de bookmaker.
+   La liste exacte ci-dessous élimine ce risque, et un contrôle de cohérence est imprimé
+   au lancement pour vérifier explicitement que les features engineered (streak,
+   momentum, quality_ema, delta_form, ema_long, r10_*) sont bien conservées.
 """
 
 from __future__ import annotations
@@ -28,11 +39,29 @@ DATA_START = "2000-01-01"
 SELECTION_TEST_START = "2017-01-01"
 HOLDOUT_START = "2020-01-01"
 
-ODDS_LEAKAGE_PREFIXES = (
-    'player1_b365', 'player1_ps', 'player1_ex', 'player1_max', 'player1_avg',
-    'player2_b365', 'player2_ps', 'player2_ex', 'player2_max', 'player2_avg',
+# --- Colonnes de cotes de bookmaker : EXCLUSION PAR NOM EXACT -------------
+# Ancien mécanisme (prefix-based, fragile) :
+#   ODDS_LEAKAGE_PREFIXES = ('player1_b365', 'player1_ps', 'player1_ex',
+#                            'player1_max', 'player1_avg', 'player2_b365',
+#                            'player2_ps', 'player2_ex', 'player2_max', 'player2_avg')
+# Problème : 'player1_ps'.startswith(...) matche n'importe quelle future colonne
+# commençant par ces mêmes lettres (ex: 'player1_avg_opp_elo_beaten' aurait pu être
+# piégée si elle avait porté ce nom). On liste maintenant les colonnes UNE PAR UNE.
+BOOKMAKER_SUFFIXES = ('b365', 'ps', 'ex', 'max', 'avg')
+ODDS_LEAKAGE_EXACT_COLS = {
+    f"player{n}_{suffix}" for n in (1, 2) for suffix in BOOKMAKER_SUFFIXES
+}
+# Autres colonnes exactes à exclure (fuite d'information / non-features)
+OTHER_LEAKAGE_EXACT_COLS = {'player1_elo_win_prob'}
+
+ALL_EXACT_EXCLUDED_COLS = ODDS_LEAKAGE_EXACT_COLS | OTHER_LEAKAGE_EXACT_COLS
+
+# Mots-clés utilisés uniquement pour le contrôle de cohérence affiché au lancement
+# (vérifier visuellement que nos features engineered ne sont jamais exclues par erreur)
+ENGINEERED_FEATURE_KEYWORDS = (
+    "streak", "quality_ema", "momentum_", "delta_form_", "ema_long_",
+    "r10_avg_opp_elo_beaten", "r10_upset_win_pct", "r10_bad_loss_pct",
 )
-ODDS_LEAKAGE_EXACT = ('player1_elo_win_prob',)
 
 
 def xgbModelBinary(xtrain, ytrain, xval, yval, p):
@@ -61,23 +90,55 @@ def xgbModelBinary(xtrain, ytrain, xval, yval, p):
     return model
 
 
-def assessStrategySingleModel(df_train, df_val, df_test, xgb_params, model_name="1"):
+def get_candidate_feature_cols(columns) -> list[str]:
+    """Détermine les colonnes candidates à devenir des features, en excluant :
+    - les colonnes de métadonnées/résultat (drop_cols)
+    - les colonnes de cotes de bookmaker et player1_elo_win_prob (nom EXACT, pas préfixe)
+    - les colonnes de noms de joueurs (player1_name / player2_name)
+    Le typage numérique final est décidé ensuite par select_dtypes (voir appelant).
+    """
+    drop_cols = {
+        'target_player1_won', 'tourney_date', 'tourney_id', 'match_num',
+        'dataset_split', 'minutes', 'l_1stIn', 'w_1stIn', 'l_svpt', 'w_svpt'
+    }
+    return [
+        c for c in columns
+        if c not in drop_cols
+        and c not in ALL_EXACT_EXCLUDED_COLS
+        and c not in ('player1_name', 'player2_name')
+    ]
+
+
+def log_feature_selection_sanity_check(df_train_columns, feature_cols) -> None:
+    """Affiche un contrôle de cohérence : combien de nos features engineered
+    (streak, momentum, quality_ema, delta_form, ema_long, r10_*) sont bien
+    présentes dans feature_cols. Sert à détecter immédiatement toute
+    régression future (ex: renommage de colonne, nouveau filtre trop large)."""
+    engineered_in_dataset = [
+        c for c in df_train_columns
+        if any(k in c for k in ENGINEERED_FEATURE_KEYWORDS)
+    ]
+    engineered_kept = [c for c in engineered_in_dataset if c in feature_cols]
+    engineered_dropped = [c for c in engineered_in_dataset if c not in feature_cols]
+
+    print(f"→ Contrôle features engineered : {len(engineered_kept)}/{len(engineered_in_dataset)} "
+          f"colonnes (streak/momentum/quality_ema/delta_form/ema_long/r10_*) conservées comme features.")
+    if engineered_dropped:
+        print(f"  ⚠️ ATTENTION — {len(engineered_dropped)} colonnes engineered exclues par erreur "
+              f"(probablement non numériques après lecture CSV) :")
+        for c in engineered_dropped[:20]:
+            print(f"     - {c}")
+
+
+def assessStrategySingleModel(df_train, df_val, df_test, xgb_params, model_name="1", verbose_check=False):
     if len(df_test) == 0 or len(df_train) == 0:
         return None
 
-    drop_cols = [
-        'target_player1_won', 'tourney_date', 'tourney_id', 'match_num',
-        'dataset_split', 'minutes', 'l_1stIn', 'w_1stIn', 'l_svpt', 'w_svpt'
-    ]
-    candidate_cols = [
-        c for c in df_train.columns
-        if c not in drop_cols
-        and c not in ODDS_LEAKAGE_EXACT
-        and not c.startswith('player1_name')
-        and not c.startswith('player2_name')
-        and not c.startswith(ODDS_LEAKAGE_PREFIXES)
-    ]
+    candidate_cols = get_candidate_feature_cols(df_train.columns)
     feature_cols = df_train[candidate_cols].select_dtypes(include=[np.number, bool, 'category']).columns.tolist()
+
+    if verbose_check:
+        log_feature_selection_sanity_check(df_train.columns, feature_cols)
 
     xtrain = df_train[feature_cols]
     ytrain = df_train['target_player1_won']
@@ -136,7 +197,7 @@ def assessStrategySingleModel(df_train, df_val, df_test, xgb_params, model_name=
 
 
 def run_majority_voting_ensemble(df_full, test_start_idx, train_window_days=730, val_window_days=180,
-                                  test_window_days=90, xgb_params={}):
+                                  test_window_days=90, xgb_params={}, verbose_check=False):
     df_full = df_full.sort_values('tourney_date').reset_index(drop=True)
     offsets = [0, -20, 20, -50, 50, -90, 90]
     sub_dfs_conf = []
@@ -156,7 +217,13 @@ def run_majority_voting_ensemble(df_full, test_start_idx, train_window_days=730,
         if len(df_test) == 0 or len(df_train) == 0:
             continue
 
-        res = assessStrategySingleModel(df_train, df_val, df_test, xgb_params, model_name=model_name)
+        # Contrôle de cohérence des features affiché une seule fois (premier
+        # sous-modèle du tout premier appel), pour ne pas spammer les logs
+        # tout en garantissant une vérification effective à chaque run.
+        res = assessStrategySingleModel(
+            df_train, df_val, df_test, xgb_params, model_name=model_name,
+            verbose_check=(verbose_check and i == 0)
+        )
         if res is not None:
             sub_dfs_conf.append(res.set_index('match_idx'))
 
@@ -183,7 +250,7 @@ def run_majority_voting_ensemble(df_full, test_start_idx, train_window_days=730,
 
     final_odds = merged[odds_cols[0]]
     final_won = merged[won_cols[0]]
-    
+
     final_date = merged.loc[:, merged.columns.get_loc('tourney_date')] if merged.columns.tolist().count('tourney_date') == 1 else merged.iloc[:, [c == 'tourney_date' for c in merged.columns]].iloc[:, 0]
 
     final_df = pd.DataFrame({
@@ -302,8 +369,13 @@ def main():
     first_test_idx = test_start_indices[0]
     step = 1500
     all_test_results = []
+    first_iteration = True
     for current_test_idx in range(first_test_idx, len(df), step):
-        res = run_majority_voting_ensemble(df, test_start_idx=current_test_idx, xgb_params=xgb_params)
+        res = run_majority_voting_ensemble(
+            df, test_start_idx=current_test_idx, xgb_params=xgb_params,
+            verbose_check=first_iteration
+        )
+        first_iteration = False
         if res is not None:
             all_test_results.append(res)
 

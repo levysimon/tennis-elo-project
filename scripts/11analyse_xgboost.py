@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Version 2.
+Version 3.
 
-CHANGEMENT PRINCIPAL : la v1 comparait modèle complet vs baseline Elo sur
-UN SEUL split (train <= 2023, test >= 2024). Un seul split donne un seul
-chiffre, sans mesure d'incertitude ni de stabilité dans le temps. Ici on
-répète la comparaison sur plusieurs origines de test glissantes (walk-
-forward multi-origines) et on rapporte :
-  - la moyenne et l'écart-type de l'écart d'accuracy / log-loss entre le
-    modèle complet et la baseline Elo, à travers les périodes,
-  - un intervalle de confiance bootstrap sur cet écart moyen.
-Cela permet de répondre à la question "le gain du modèle complet sur Elo
-est-il stable dans le temps, ou est-ce un artefact d'un split particulier ?"
-
-DATA_START est remonté à 2002 (si votre dataset couvre bien cette période)
-pour donner davantage de matchs d'entraînement à chaque origine, sans rien
-changer à la logique de séparation temporelle stricte (toujours entraîné
-uniquement sur le passé de chaque origine de test).
+CHANGEMENTS PAR RAPPORT A LA V2 :
+1. Filtre d'exclusion des colonnes de cotes : passage d'une exclusion par
+   PRÉFIXE (startswith) à une exclusion par NOM EXACT, identique au correctif
+   déjà appliqué à modeling.py. L'ancien mécanisme fonctionnait avec le
+   dataset actuel (vérifié : aucune des 54 colonnes engineered streak/
+   momentum/quality_ema/delta_form/ema_long/r10_* n'était perdue), mais
+   restait fragile : une future feature nommée 'player1_avg_XXX' ou
+   'player1_max_XXX' aurait été silencieusement exclue sans avertissement.
+2. SUPPRESSION de `.fillna(0)` sur les features avant construction des
+   DMatrix. Plusieurs des nouvelles features (momentum_*, delta_form_*,
+   r10_avg_opp_elo_beaten, quality_ema) ont 0 comme valeur RÉELLE et
+   significative (ex: momentum nul = pas de tendance). Remplacer les NaN
+   (= historique insuffisant, cf. build_features.py) par 0 rendait "pas de
+   donnée" et "valeur réellement nulle" indiscernables pour le modèle,
+   diluant le signal de ces features. XGBoost gère nativement les valeurs
+   manquantes (apprentissage d'une direction de split par défaut) : on lui
+   laisse les NaN tels quels.
+3. Le tableau d'importance des features sauvegarde désormais la table
+   COMPLÈTE (plus de head(50)), et une liste séparée des features JAMAIS
+   utilisées dans un split (gain nul, absentes de model.get_score()) - les
+   deux causes de "feature absente du tableau" étaient confondues avant.
 """
 
 from __future__ import annotations
@@ -33,17 +39,21 @@ DATASET_FILE = PROJECT_ROOT / "data" / "processed" / "atp_modeling_dataset.csv"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs" / "analyse xgboost"
 
 DATA_START = "2000-01-01"
-# Origines de test successives : chaque origine définit une coupure
-# train(< cutoff) / test([cutoff, cutoff + TEST_WINDOW_DAYS jours équivalent
-# en nombre de lignes approximatif, ici on utilise directement des dates)).
 TEST_ORIGINS = ["2022-01-01", "2023-01-01", "2024-01-01", "2025-01-01"]
-TEST_WINDOW_END = "2026-12-31"  # chaque test va de son origine jusqu'à la fin des données
+TEST_WINDOW_END = "2026-12-31"
 
-ODDS_LEAKAGE_PREFIXES = (
-    'player1_b365', 'player1_ps', 'player1_ex', 'player1_max', 'player1_avg',
-    'player2_b365', 'player2_ps', 'player2_ex', 'player2_max', 'player2_avg',
+# --- Colonnes de cotes de bookmaker : EXCLUSION PAR NOM EXACT (cf. modeling.py) ---
+BOOKMAKER_SUFFIXES = ('b365', 'ps', 'ex', 'max', 'avg')
+ODDS_LEAKAGE_EXACT_COLS = {
+    f"player{n}_{suffix}" for n in (1, 2) for suffix in BOOKMAKER_SUFFIXES
+}
+OTHER_LEAKAGE_EXACT_COLS = {'player1_elo_win_prob'}
+ALL_EXACT_EXCLUDED_COLS = ODDS_LEAKAGE_EXACT_COLS | OTHER_LEAKAGE_EXACT_COLS
+
+ENGINEERED_FEATURE_KEYWORDS = (
+    "streak", "quality_ema", "momentum_", "delta_form_", "ema_long_",
+    "r10_avg_opp_elo_beaten", "r10_upset_win_pct", "r10_bad_loss_pct",
 )
-ODDS_LEAKAGE_EXACT = ('player1_elo_win_prob',)
 
 DROP_COLS = [
     'target_player1_won', 'tourney_date', 'tourney_id', 'match_num',
@@ -51,16 +61,36 @@ DROP_COLS = [
 ]
 
 
-def get_feature_cols(df):
+def get_feature_cols(df, verbose=False):
     candidate_cols = [
         c for c in df.columns
         if c not in DROP_COLS
-        and c not in ODDS_LEAKAGE_EXACT
-        and not c.startswith("player1_name")
-        and not c.startswith("player2_name")
-        and not c.startswith(ODDS_LEAKAGE_PREFIXES)
+        and c not in ALL_EXACT_EXCLUDED_COLS
+        and c not in ('player1_name', 'player2_name')
     ]
-    return df[candidate_cols].select_dtypes(include=[np.number, bool]).columns.tolist()
+    feature_cols = df[candidate_cols].select_dtypes(include=[np.number, bool]).columns.tolist()
+
+    if verbose:
+        engineered_in_dataset = [c for c in df.columns if any(k in c for k in ENGINEERED_FEATURE_KEYWORDS)]
+        engineered_kept = [c for c in engineered_in_dataset if c in feature_cols]
+        engineered_dropped = [c for c in engineered_in_dataset if c not in feature_cols]
+        print(f"   → Contrôle features engineered : {len(engineered_kept)}/{len(engineered_in_dataset)} "
+              f"colonnes (streak/momentum/quality_ema/delta_form/ema_long/r10_*) conservées comme features.")
+        if engineered_dropped:
+            print(f"     ⚠️ {len(engineered_dropped)} colonnes engineered exclues (probablement non numériques) :")
+            for c in engineered_dropped[:20]:
+                print(f"        - {c}")
+
+    return feature_cols
+
+
+def build_dmatrix(df, feature_cols, label_col=None):
+    """Construit une DMatrix SANS remplacer les NaN par 0 : pour plusieurs de
+    nos features (momentum_*, delta_form_*, r10_avg_opp_elo_beaten,
+    quality_ema), 0 est une valeur réelle distincte de 'donnée manquante'.
+    XGBoost gère nativement les NaN (missing=np.nan par défaut sur DMatrix)."""
+    label = df[label_col] if label_col else None
+    return xgb.DMatrix(df[feature_cols], label=label, missing=np.nan)
 
 
 def train_and_eval_one_origin(df, cutoff, feature_cols):
@@ -69,8 +99,8 @@ def train_and_eval_one_origin(df, cutoff, feature_cols):
     if len(train) < 500 or len(test) < 100:
         return None
 
-    dtrain = xgb.DMatrix(train[feature_cols].fillna(0), label=train["target_player1_won"])
-    dtest = xgb.DMatrix(test[feature_cols].fillna(0), label=test["target_player1_won"])
+    dtrain = build_dmatrix(train, feature_cols, "target_player1_won")
+    dtest = build_dmatrix(test, feature_cols, "target_player1_won")
     params = {
         "objective": "binary:logistic", "eval_metric": "logloss",
         "max_depth": 5, "eta": 0.1, "subsample": 0.8, "colsample_bytree": 0.8,
@@ -88,6 +118,10 @@ def train_and_eval_one_origin(df, cutoff, feature_cols):
     elo_metrics = None
     needed = ["player1_elo_pre", "player2_elo_pre", "player1_surface_elo_pre", "player2_surface_elo_pre"]
     if all(c in df.columns for c in needed):
+        # La baseline Elo (régression logistique sur 2 features) reste sur
+        # fillna(0) : ici 0 pour un ÉCART d'Elo entre deux joueurs (diff=0)
+        # a un sens raisonnable par défaut (aucun avantage), contrairement
+        # aux features engineered ci-dessus où 0 collisionne avec un vrai 0.
         train_elo_diff = (train["player1_elo_pre"] - train["player2_elo_pre"]).fillna(0)
         train_surf_diff = (train["player1_surface_elo_pre"] - train["player2_surface_elo_pre"]).fillna(0)
         test_elo_diff = (test["player1_elo_pre"] - test["player2_elo_pre"]).fillna(0)
@@ -111,7 +145,6 @@ def train_and_eval_one_origin(df, cutoff, feature_cols):
 
 
 def bootstrap_ci_on_diffs(diffs, n_boot=5000, seed=0):
-    """IC bootstrap sur la moyenne d'une série de différences (une par origine)."""
     diffs = np.array([d for d in diffs if not np.isnan(d)])
     if len(diffs) == 0:
         return np.nan, np.nan, np.nan
@@ -123,6 +156,35 @@ def bootstrap_ci_on_diffs(diffs, n_boot=5000, seed=0):
         means[i] = sample.mean()
     lo, hi = np.percentile(means, [2.5, 97.5])
     return diffs.mean(), lo, hi
+
+
+def save_feature_importance(model, feature_cols, output_dir):
+    """Sauvegarde la table COMPLÈTE d'importance (plus de head(50)), et une
+    liste séparée des features candidates jamais utilisées dans un split
+    (gain nul -> absentes de model.get_score()). Avant, ces deux causes de
+    'feature absente du tableau' (troncature à 50 vs gain réellement nul)
+    étaient indiscernables."""
+    gain = model.get_score(importance_type="gain")
+    imp_table = pd.Series(gain).sort_values(ascending=False).rename("gain").to_frame()
+    imp_table.to_csv(output_dir / "feature_importance_last_origin_full.csv")
+
+    never_used = sorted(set(feature_cols) - set(gain.keys()))
+    with open(output_dir / "feature_importance_never_used.txt", "w") as f:
+        f.write(f"{len(never_used)} features candidates JAMAIS utilisées dans un split "
+                f"(gain nul) sur cette origine :\n")
+        for c in never_used:
+            f.write(f"  {c}\n")
+
+    engineered_never_used = [c for c in never_used if any(k in c for k in ENGINEERED_FEATURE_KEYWORDS)]
+    print(f"\n📄 Importance COMPLÈTE ({len(imp_table)} features utilisées) sauvegardée dans "
+          f"{output_dir / 'feature_importance_last_origin_full.csv'}")
+    print(f"📄 {len(never_used)} features jamais utilisées listées dans "
+          f"{output_dir / 'feature_importance_never_used.txt'} "
+          f"(dont {len(engineered_never_used)} parmi nos features engineered)")
+    if engineered_never_used:
+        print("   Features engineered à gain nul sur cette origine :")
+        for c in engineered_never_used[:20]:
+            print(f"     - {c}")
 
 
 def main():
@@ -138,7 +200,7 @@ def main():
     df = df.sort_values("tourney_date", kind="mergesort").reset_index(drop=True)
     print(f"   {len(df)} lignes utilisées à partir de {DATA_START}")
 
-    feature_cols = get_feature_cols(df)
+    feature_cols = get_feature_cols(df, verbose=True)
     print(f"   {len(feature_cols)} features candidates (cotes/marché exclues)")
 
     print("\n3. Backtest à origines multiples (walk-forward)...")
@@ -162,7 +224,7 @@ def main():
 
     print("\n=== Stabilité du gain (modèle complet - Elo) à travers les origines ===")
     acc_diffs = [r["full"]["accuracy"] - r["elo"]["accuracy"] for r in per_origin_results if r["elo"]]
-    logloss_diffs = [r["elo"]["log_loss"] - r["full"]["log_loss"] for r in per_origin_results if r["elo"]]  # positif = modèle meilleur
+    logloss_diffs = [r["elo"]["log_loss"] - r["full"]["log_loss"] for r in per_origin_results if r["elo"]]
 
     acc_mean, acc_lo, acc_hi = bootstrap_ci_on_diffs(acc_diffs)
     ll_mean, ll_lo, ll_hi = bootstrap_ci_on_diffs(logloss_diffs)
@@ -179,17 +241,12 @@ def main():
     last_train = df[df["tourney_date"] < TEST_ORIGINS[-1]]
     last_test = df[(df["tourney_date"] >= TEST_ORIGINS[-1]) & (df["tourney_date"] <= TEST_WINDOW_END)]
     if len(last_train) > 500 and len(last_test) > 100:
-        dtrain = xgb.DMatrix(last_train[feature_cols].fillna(0), label=last_train["target_player1_won"])
+        dtrain = build_dmatrix(last_train, feature_cols, "target_player1_won")
         params = {"objective": "binary:logistic", "eval_metric": "logloss", "max_depth": 5,
                   "eta": 0.1, "subsample": 0.8, "colsample_bytree": 0.8}
         model = xgb.train(params, dtrain, num_boost_round=200)
-        gain = model.get_score(importance_type="gain")
-        imp_table = pd.Series(gain).sort_values(ascending=False).head(50).rename("gain").to_frame()
-        imp_table.to_csv(OUTPUTS_DIR / "feature_importance_last_origin.csv")
-        print(f"\n📄 Importance des features (dernière origine) sauvegardée dans "
-              f"{OUTPUTS_DIR / 'feature_importance_last_origin.csv'}")
+        save_feature_importance(model, feature_cols, OUTPUTS_DIR)
 
-    # Sauvegarde du résumé par origine + stabilité
     summary_rows = []
     for r in per_origin_results:
         row = {"cutoff": r["cutoff"], "n_train": r["n_train"], "n_test": r["n_test"],

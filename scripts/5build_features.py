@@ -1,7 +1,8 @@
 """
 build_features.py
 ==================
-Étape 4 du projet : features de service/retour, lissées par moyenne glissante.
+Étape 4 du projet : features de service/retour, lissées par moyenne glissante,
++ momentum/tendance et qualité des adversaires récents (Étape 4bis).
 
 Pour chaque match, on dérive PAR JOUEUR :
   - srv_1st_pct       : % de points gagnés au 1er service
@@ -26,17 +27,50 @@ Ces métriques sont ensuite lissées de TROIS façons :
      confondues ("forme récente" générale).
   2. Moyenne glissante sur les 12 DERNIERS MOIS, UNIQUEMENT sur dur
      ("forme récente" spécifique à la surface qui nous intéresse).
-  3. Moyenne mobile exponentielle (EMA), pondérée par la récence en JOURS
-     (demi-vie = EMA_HALF_LIFE_DAYS) plutôt que par un nombre fixe de matchs
-     ou une fenêtre calendaire dure — absorbe mieux les pauses saisonnières
-     du calendrier tennis qu'une fenêtre à bornes fixes.
+  3. Moyenne mobile exponentielle (EMA) COURTE, pondérée par la récence en
+     JOURS (demi-vie = EMA_HALF_LIFE_DAYS) plutôt que par un nombre fixe de
+     matchs ou une fenêtre calendaire dure — absorbe mieux les pauses
+     saisonnières du calendrier tennis qu'une fenêtre à bornes fixes.
 
+Étape 4bis — Momentum et qualité des adversaires (AJOUT) :
+  4. EMA LONGUE (demi-vie = EMA_LONG_HALF_LIFE_DAYS, 120j par défaut) sur
+     les mêmes métriques que l'EMA courte. Sert de référence "niveau de fond"
+     pour détecter une tendance : si la forme courte s'écarte nettement de
+     la forme longue, le joueur est en progression ou en déclin.
+  5. `delta_form_*` = ema_{metric} (courte) - ema_long_{metric}. Positif =
+     le joueur performe mieux que sa moyenne longue durée en ce moment
+     (dynamique montante) ; négatif = dynamique descendante.
+  6. `momentum_*` (dominance_ratio, hold_pct) = différence entre la moyenne
+     de la 2e moitié et celle de la 1re moitié des ROLLING_WINDOW_N derniers
+     matchs. Capture la pente à l'intérieur même de la fenêtre r10, distincte
+     du delta_form qui compare deux fenêtres temporelles différentes.
+  7. `streak` : série de victoires/défaites consécutives, signée (+3 = 3
+     victoires de suite, -2 = 2 défaites de suite). Remise à 1/-1 dès le
+     premier résultat de signe opposé.
+  8. Qualité des adversaires sur les ROLLING_WINDOW_N derniers matchs :
+       - `r10_avg_opp_elo_beaten` : Elo (surface si disponible, sinon
+         global) moyen des adversaires BATTUS dans la fenêtre.
+       - `r10_upset_win_pct` : % des victoires de la fenêtre obtenues contre
+         un adversaire mieux coté (Elo pré-match supérieur au sien).
+       - `r10_bad_loss_pct` : % des défaites de la fenêtre concédées contre
+         un adversaire moins bien coté (signal souvent plus informatif
+         qu'une simple série de victoires faciles).
+       - `quality_ema` : EMA (même demi-vie que l'EMA courte) de
+         (elo_adversaire - elo_propre) calculée UNIQUEMENT sur les matchs
+         gagnés — mesure la qualité pondérée par la récence des victoires
+         récentes, indépendamment du nombre de matchs joués.
+  Ces features nécessitent l'Elo pré-match des DEUX joueurs (colonnes issues
+  de build_elo.py). Cf. `get_elo_pre()` pour la logique de repli si l'Elo par
+  surface n'est pas disponible.
 
 Gestion de l'historique insuffisant :
 Si un joueur a moins de MIN_HISTORY_FOR_AVERAGE matchs valides, la moyenne
 (quel que soit le mode) n'est PAS calculée (case vide) plutôt que de
 produire une estimation bruitée sur 1 ou 2 matchs. Le nombre de matchs
 réellement disponibles est toujours indiqué à côté (colonnes `*_n`).
+Le momentum (calcul de pente sur 2 demi-fenêtres) exige 2x ce seuil
+(MIN_HISTORY_FOR_MOMENTUM) pour avoir au moins MIN_HISTORY_FOR_AVERAGE
+matchs valides de CHAQUE côté de la coupure.
 
 Usage:
     python scripts/build_features.py
@@ -65,7 +99,7 @@ ROLLING_WINDOW_DAYS_HARD = 365  # fenêtre en jours pour la moyenne "12 derniers
 
 # Seuil minimum de matchs valides dans la fenêtre pour publier une moyenne.
 # En-dessous, on considère l'estimation trop bruitée/peu fiable et on laisse
-# le champ vide 
+# le champ vide
 MIN_HISTORY_FOR_AVERAGE = 3
 
 METRICS = [
@@ -76,8 +110,33 @@ METRICS = [
 # Demi-vie (en jours) de la pondération EMA — un match d'il y a HALF_LIFE_DAYS
 # pèse deux fois moins qu'un match d'aujourd'hui. Fenêtre complémentaire aux
 # moyennes r10
-
 EMA_HALF_LIFE_DAYS = 45.0
+
+# --- Étape 4bis : momentum / qualité d'adversaires --------------------------
+
+# Demi-vie de l'EMA "longue" utilisée comme référence de niveau de fond pour
+# détecter une tendance (progression/déclin) via delta_form_*. 120j ≈ un peu
+# moins d'une demi-saison tennis : assez long pour lisser les creux/pics
+# ponctuels, assez court pour ne pas mélanger deux saisons différentes.
+EMA_LONG_HALF_LIFE_DAYS = 120.0
+
+# Métriques sur lesquelles on calcule un momentum "intra-fenêtre r10"
+# (pente 2e moitié vs 1re moitié). Limité à dominance_ratio et hold_pct :
+# ce sont les deux résumés les plus synthétiques de la forme d'un joueur
+# (respectivement "domination globale des points" et "solidité au service"),
+# pas besoin de dupliquer le calcul sur les 9 métriques.
+MOMENTUM_METRICS = ["dominance_ratio", "hold_pct"]
+
+# Le momentum coupe la fenêtre r10 en deux moitiés : il faut donc au moins
+# 2x le seuil normal pour avoir MIN_HISTORY_FOR_AVERAGE points valides de
+# chaque côté de la coupure.
+MIN_HISTORY_FOR_MOMENTUM = MIN_HISTORY_FOR_AVERAGE * 2
+
+# Colonnes d'Elo pré-match à utiliser pour la qualité d'adversaire, par ordre
+# de préférence. On privilégie l'Elo spécifique à la surface du match (plus
+# pertinent pour juger "contre qui il a gagné sur CETTE surface"), avec
+# repli sur l'Elo global si absent (matchs anciens / colonnes manquantes).
+ELO_COLUMN_CANDIDATES = ["surface_elo_pre", "elo_pre"]
 
 
 def to_float(value: str) -> float | None:
@@ -94,6 +153,19 @@ def safe_ratio(numerator: float | None, denominator: float | None) -> float | No
     if numerator is None or denominator is None or denominator == 0:
         return None
     return numerator / denominator
+
+
+def get_elo_pre(row: dict, prefix: str) -> float | None:
+    """Renvoie l'Elo pré-match d'un joueur (prefix='winner' ou 'loser'),
+    en essayant d'abord l'Elo par surface, puis l'Elo global. Renvoie None
+    si aucune des deux colonnes n'est présente/valide (ex : build_elo.py
+    pas encore lancé, ou colonnes nommées différemment) — dans ce cas les
+    features de qualité d'adversaire ne seront simplement pas calculées."""
+    for suffix in ELO_COLUMN_CANDIDATES:
+        val = to_float(row.get(f"{prefix}_{suffix}", ""))
+        if val is not None:
+            return val
+    return None
 
 
 def compute_side_stats(row: dict, prefix: str) -> dict[str, float] | None:
@@ -234,30 +306,47 @@ def compute_match_player_stats(row: dict) -> dict[str, dict[str, float] | None]:
 
 
 class PlayerHistory:
-    """Historique glissant d'un joueur pour trois modes de lissage :
-    - `recent10`  : deque des 10 derniers matchs valides (toutes surfaces)
-    - `ema`       : moyenne mobile exponentielle (EMA), pondérée par la
-                    récence en JOURS plutôt que par un nombre fixe de matchs
-                    ou une fenêtre calendaire dure. Un match d'il y a
-                    EMA_HALF_LIFE_DAYS pèse deux fois moins qu'un match
-                    d'aujourd'hui — contrairement à r10/hard12mo, l'EMA
-                    absorbe naturellement les longues pauses saisonnières
-                    du calendrier tennis sans notion de fenêtre fixe.
+    """Historique glissant d'un joueur pour trois modes de lissage de forme
+    (r10, hard12mo, ema courte), plus les extensions momentum/qualité :
+
+    - `recent10`  : deque des 10 derniers matchs valides (toutes surfaces),
+                    enrichis des champs 'result'/'own_elo_pre'/'opp_elo_pre'
+                    utilisés pour le momentum et la qualité d'adversaire.
+    - `ema`       : moyenne mobile exponentielle COURTE (demi-vie
+                    EMA_HALF_LIFE_DAYS), pondérée par la récence en JOURS.
+    - `ema_long`  : même principe, demi-vie EMA_LONG_HALF_LIFE_DAYS — sert
+                    de référence de niveau de fond pour delta_form_*.
+    - `streak`    : série de victoires/défaites consécutives (signée).
+    - `quality_ema` : EMA de (elo_adversaire - elo_propre), calculée
+                    uniquement sur les matchs GAGNÉS.
     """
 
     def __init__(self):
         self.recent10: deque[dict] = deque(maxlen=ROLLING_WINDOW_N)
         self.hard12mo: deque[tuple[str, dict]] = deque()  # (date_str, stats)
+
         self.ema_values: dict[str, float] = {}
         self.ema_last_date: datetime | None = None
         self.ema_metric_counts: dict[str, int] = defaultdict(int)
 
-    def get_rolling_averages(self, current_date: str) -> dict[str, float | str]:
-        """Renvoie les moyennes glissantes PRE-match (avant tout ajout du
-        match courant), pour les trois modes, avec les compteurs `_n`."""
+        # --- Étape 4bis ---
+        self.ema_long_values: dict[str, float] = {}
+        self.ema_long_last_date: datetime | None = None
+        self.ema_long_metric_counts: dict[str, int] = defaultdict(int)
 
-        out: dict[str, float | str] = {}
+        self.streak: int = 0  # >0 = série de victoires, <0 = série de défaites
 
+        self.quality_ema_value: float | None = None
+        self.quality_ema_last_date: datetime | None = None
+        self.quality_ema_n: int = 0  # nombre de VICTOIRES vues (dénominateur du seuil)
+
+    def get_rolling_averages(self, current_date: str) -> dict[str, float | str | int]:
+        """Renvoie les moyennes/indicateurs glissants PRE-match (avant tout
+        ajout du match courant), pour tous les modes, avec les compteurs `_n`."""
+
+        out: dict[str, float | str | int] = {}
+
+        # --- r10 (inchangé) ---
         n_recent = len(self.recent10)
         out["r10_n"] = n_recent
         for metric in METRICS:
@@ -267,22 +356,80 @@ class PlayerHistory:
             else:
                 out[f"r10_{metric}"] = ""
 
-        # EMA : nécessite au moins 1 match antérieur (par construction, une
-        # moyenne pondérée par récence n'a pas de notion de "trop peu de
-        # points" comme r10 — mais on exige quand même un minimum
-        # de matchs vus pour rester cohérent avec le traitement des autres
-        # fenêtres et éviter de publier une "moyenne" basée sur un seul match.
-        # EMA : le seuil s'applique PAR MÉTRIQUE (via ema_metric_counts), pas
-        # sur le nombre total de matchs vus — `SvGms` peut manquer sur un
-        # match donné sans affecter les autres métriques de ce même match,
-        # donc hold_pct/break_pct peuvent avoir moins de points valides que
-        # srv_1st_pct pour un même joueur.
+        # --- EMA courte (inchangé) ---
         for metric in METRICS:
             if self.ema_metric_counts[metric] >= MIN_HISTORY_FOR_AVERAGE and metric in self.ema_values:
                 out[f"ema_{metric}"] = round(self.ema_values[metric], 4)
             else:
                 out[f"ema_{metric}"] = ""
         out["ema_n"] = self.ema_metric_counts["srv_1st_pct"]  # référence pour lisibilité du rapport
+
+        # --- Étape 4bis : EMA longue + delta_form ---
+        for metric in METRICS:
+            if self.ema_long_metric_counts[metric] >= MIN_HISTORY_FOR_AVERAGE and metric in self.ema_long_values:
+                out[f"ema_long_{metric}"] = round(self.ema_long_values[metric], 4)
+            else:
+                out[f"ema_long_{metric}"] = ""
+        out["ema_long_n"] = self.ema_long_metric_counts["srv_1st_pct"]
+
+        for metric in METRICS:
+            short_val = out.get(f"ema_{metric}")
+            long_val = out.get(f"ema_long_{metric}")
+            if short_val not in ("", None) and long_val not in ("", None):
+                out[f"delta_form_{metric}"] = round(short_val - long_val, 4)
+            else:
+                out[f"delta_form_{metric}"] = ""
+
+        # --- Étape 4bis : momentum intra-fenêtre r10 (pente 2e moitié - 1re moitié) ---
+        for metric in MOMENTUM_METRICS:
+            values = [m[metric] for m in self.recent10 if m.get(metric) is not None]
+            if len(values) >= MIN_HISTORY_FOR_MOMENTUM:
+                mid = len(values) // 2
+                first_half = values[:mid]
+                second_half = values[mid:]
+                if len(first_half) >= MIN_HISTORY_FOR_AVERAGE and len(second_half) >= MIN_HISTORY_FOR_AVERAGE:
+                    out[f"momentum_{metric}"] = round(
+                        (sum(second_half) / len(second_half)) - (sum(first_half) / len(first_half)), 4
+                    )
+                else:
+                    out[f"momentum_{metric}"] = ""
+            else:
+                out[f"momentum_{metric}"] = ""
+
+        # --- Étape 4bis : streak (valeur brute, pas de seuil d'historique) ---
+        out["streak"] = self.streak
+
+        # --- Étape 4bis : qualité des adversaires sur la fenêtre r10 ---
+        wins_in_window = [m for m in self.recent10 if m.get("result") == 1 and m.get("opp_elo_pre") is not None]
+        losses_in_window = [m for m in self.recent10 if m.get("result") == 0
+                             and m.get("opp_elo_pre") is not None and m.get("own_elo_pre") is not None]
+        wins_with_own_elo = [m for m in wins_in_window if m.get("own_elo_pre") is not None]
+
+        if len(wins_in_window) >= MIN_HISTORY_FOR_AVERAGE:
+            out["r10_avg_opp_elo_beaten"] = round(
+                sum(m["opp_elo_pre"] for m in wins_in_window) / len(wins_in_window), 2
+            )
+        else:
+            out["r10_avg_opp_elo_beaten"] = ""
+
+        if len(wins_with_own_elo) >= MIN_HISTORY_FOR_AVERAGE:
+            n_upsets = sum(1 for m in wins_with_own_elo if m["opp_elo_pre"] > m["own_elo_pre"])
+            out["r10_upset_win_pct"] = round(n_upsets / len(wins_with_own_elo), 4)
+        else:
+            out["r10_upset_win_pct"] = ""
+
+        if len(losses_in_window) >= MIN_HISTORY_FOR_AVERAGE:
+            n_bad_losses = sum(1 for m in losses_in_window if m["opp_elo_pre"] < m["own_elo_pre"])
+            out["r10_bad_loss_pct"] = round(n_bad_losses / len(losses_in_window), 4)
+        else:
+            out["r10_bad_loss_pct"] = ""
+
+        # --- Étape 4bis : quality_ema (EMA de la marge d'Elo sur les victoires) ---
+        if self.quality_ema_n >= MIN_HISTORY_FOR_AVERAGE and self.quality_ema_value is not None:
+            out["quality_ema"] = round(self.quality_ema_value, 2)
+        else:
+            out["quality_ema"] = ""
+        out["quality_ema_n"] = self.quality_ema_n
 
         return out
 
@@ -299,11 +446,22 @@ class PlayerHistory:
             except ValueError:
                 self.hard12mo.popleft()
 
+    @staticmethod
+    def _ema_alpha(days_elapsed: int, half_life_days: float) -> float:
+        """Poids donné au NOUVEAU point pour une EMA pondérée par le temps.
+        days_elapsed=0 (deux matchs le même jour, ex: double relancé) retombe
+        sur un alpha fixe de 0.5 plutôt qu'un alpha nul qui ignorerait
+        totalement le nouveau match."""
+        if days_elapsed <= 0:
+            return 0.5
+        return 1.0 - 0.5 ** (days_elapsed / half_life_days)
 
     def add_match(self, date_str: str, surface_norm: str, stats: dict) -> None:
+        """`stats` contient les métriques de service/retour habituelles,
+        PLUS (Étape 4bis) 'result' (1=victoire/0=défaite), 'own_elo_pre' et
+        'opp_elo_pre' (peuvent être None si l'Elo n'était pas disponible)."""
         self.recent10.append(stats)
 
-        # --- Mise à jour EMA ---
         current = None
         try:
             current = datetime.strptime(date_str, "%Y-%m-%d")
@@ -311,22 +469,15 @@ class PlayerHistory:
             pass
 
         if current is not None:
+            # --- EMA courte (inchangé) ---
             if self.ema_last_date is None:
-                # Premier match : initialise l'EMA directement à la valeur
-                # observée (pas de "avant" à pondérer).
                 for metric in METRICS:
                     if stats.get(metric) is not None:
                         self.ema_values[metric] = stats[metric]
                         self.ema_metric_counts[metric] += 1
             else:
                 days_elapsed = max(0, (current - self.ema_last_date).days)
-                alpha = 1.0 - 0.5 ** (days_elapsed / EMA_HALF_LIFE_DAYS) if days_elapsed > 0 else 0.5 ** 0  # noqa
-                # `alpha` = poids donné au NOUVEAU match. Avec days_elapsed=0
-                # (deux matchs le même jour, ex: double relancé), on retombe
-                # sur un alpha fixe raisonnable (0.5) plutôt qu'un alpha nul
-                # qui ignorerait totalement le nouveau match.
-                if days_elapsed == 0:
-                    alpha = 0.5
+                alpha = self._ema_alpha(days_elapsed, EMA_HALF_LIFE_DAYS)
                 for metric in METRICS:
                     if stats.get(metric) is not None:
                         old = self.ema_values.get(metric, stats[metric])
@@ -339,11 +490,53 @@ class PlayerHistory:
                     # décroissance temporelle sans nouvelle observation.
             self.ema_last_date = current
 
+            # --- Étape 4bis : EMA longue (même logique, demi-vie différente) ---
+            if self.ema_long_last_date is None:
+                for metric in METRICS:
+                    if stats.get(metric) is not None:
+                        self.ema_long_values[metric] = stats[metric]
+                        self.ema_long_metric_counts[metric] += 1
+            else:
+                days_elapsed_long = max(0, (current - self.ema_long_last_date).days)
+                alpha_long = self._ema_alpha(days_elapsed_long, EMA_LONG_HALF_LIFE_DAYS)
+                for metric in METRICS:
+                    if stats.get(metric) is not None:
+                        old_long = self.ema_long_values.get(metric, stats[metric])
+                        self.ema_long_values[metric] = alpha_long * stats[metric] + (1 - alpha_long) * old_long
+                        self.ema_long_metric_counts[metric] += 1
+            self.ema_long_last_date = current
+
+            # --- Étape 4bis : quality_ema, uniquement mis à jour sur les victoires ---
+            result = stats.get("result")
+            own_elo = stats.get("own_elo_pre")
+            opp_elo = stats.get("opp_elo_pre")
+            if result == 1 and own_elo is not None and opp_elo is not None:
+                margin = opp_elo - own_elo  # >0 = a battu un adversaire mieux coté
+                if self.quality_ema_last_date is None or self.quality_ema_value is None:
+                    self.quality_ema_value = margin
+                else:
+                    days_elapsed_q = max(0, (current - self.quality_ema_last_date).days)
+                    alpha_q = self._ema_alpha(days_elapsed_q, EMA_HALF_LIFE_DAYS)
+                    self.quality_ema_value = alpha_q * margin + (1 - alpha_q) * self.quality_ema_value
+                self.quality_ema_last_date = current
+                self.quality_ema_n += 1
+
+            # --- Étape 4bis : streak ---
+            if result == 1:
+                self.streak = self.streak + 1 if self.streak >= 0 else 1
+            elif result == 0:
+                self.streak = self.streak - 1 if self.streak <= 0 else -1
+
 
 def process(matches: list[dict]) -> tuple[list[dict], dict]:
     histories: dict[str, PlayerHistory] = defaultdict(PlayerHistory)
     enriched_rows: list[dict] = []
-    stats_counter = {"n_matches": 0, "n_missing_serve_stats": 0, "n_missing_sv_gms": 0}
+    stats_counter = {
+        "n_matches": 0,
+        "n_missing_serve_stats": 0,
+        "n_missing_sv_gms": 0,
+        "n_missing_elo_for_quality": 0,  # Étape 4bis : au moins un Elo pré-match absent
+    }
 
     for row in matches:
         winner_id = (row.get("winner_id") or "").strip()
@@ -368,14 +561,28 @@ def process(matches: list[dict]) -> tuple[list[dict], dict]:
         if to_float(row.get("w_SvGms", "")) is None or to_float(row.get("l_SvGms", "")) is None:
             stats_counter["n_missing_sv_gms"] += 1
 
+        # --- Étape 4bis : Elo pré-match des deux joueurs (pour qualité d'adversaire) ---
+        winner_elo_pre = get_elo_pre(row, "winner")
+        loser_elo_pre = get_elo_pre(row, "loser")
+        if winner_elo_pre is None or loser_elo_pre is None:
+            stats_counter["n_missing_elo_for_quality"] += 1
+
         match_stats = compute_match_player_stats(row)
         if match_stats["winner"] is None or match_stats["loser"] is None:
             stats_counter["n_missing_serve_stats"] += 1
         else:
             if winner_id and date_str:
-                histories[winner_id].add_match(date_str, surface_norm, match_stats["winner"])
+                winner_stats = dict(match_stats["winner"])
+                winner_stats["result"] = 1
+                winner_stats["own_elo_pre"] = winner_elo_pre
+                winner_stats["opp_elo_pre"] = loser_elo_pre
+                histories[winner_id].add_match(date_str, surface_norm, winner_stats)
             if loser_id and date_str:
-                histories[loser_id].add_match(date_str, surface_norm, match_stats["loser"])
+                loser_stats = dict(match_stats["loser"])
+                loser_stats["result"] = 0
+                loser_stats["own_elo_pre"] = loser_elo_pre
+                loser_stats["opp_elo_pre"] = winner_elo_pre
+                histories[loser_id].add_match(date_str, surface_norm, loser_stats)
 
         stats_counter["n_matches"] += 1
         enriched_rows.append(new_row)
@@ -411,9 +618,14 @@ def write_report(rows: list[dict], stats_counter: dict, output_path: Path) -> No
     def coverage(mode: str, metric: str) -> int:
         return sum(1 for r in rows if r.get(f"w_{mode}_{metric}") not in ("", None))
 
+    def coverage_field(field: str) -> int:
+        return sum(1 for r in rows if r.get(f"w_{field}") not in ("", None))
+
     modes = [("r10", "10 derniers matchs, toutes surfaces"),
               ("hard12mo", "12 derniers mois, sur dur"),
-              ("ema", f"EMA, demi-vie {EMA_HALF_LIFE_DAYS:.0f}j")]
+              ("ema", f"EMA courte, demi-vie {EMA_HALF_LIFE_DAYS:.0f}j"),
+              ("ema_long", f"EMA longue, demi-vie {EMA_LONG_HALF_LIFE_DAYS:.0f}j"),
+              ("delta_form", "delta EMA courte - EMA longue")]
 
     lines = [
         "# Rapport — build_features.py",
@@ -424,7 +636,11 @@ def write_report(rows: list[dict], stats_counter: dict, output_path: Path) -> No
         f"**Matchs avec `SvGms` manquant sur au moins un camp** (affecte `hold_pct`/`break_pct` "
         f"uniquement, pas les autres métriques) : {stats_counter['n_missing_sv_gms']} "
         f"({round(100*stats_counter['n_missing_sv_gms']/max(1,n_total),2)}%)",
-        f"**Seuil minimum de matchs pour publier une moyenne :** {MIN_HISTORY_FOR_AVERAGE}\n",
+        f"**Matchs avec Elo pré-match manquant sur au moins un camp** (bloque les features "
+        f"de qualité d'adversaire pour ce match) : {stats_counter['n_missing_elo_for_quality']} "
+        f"({round(100*stats_counter['n_missing_elo_for_quality']/max(1,n_total),2)}%)",
+        f"**Seuil minimum de matchs pour publier une moyenne :** {MIN_HISTORY_FOR_AVERAGE} "
+        f"(x2 = {MIN_HISTORY_FOR_MOMENTUM} pour le momentum, qui coupe la fenêtre en 2)\n",
         "## Couverture par mode de lissage (nombre de lignes avec valeur disponible, côté gagnant)",
         "| Mode | " + " | ".join(METRICS) + " |",
         "|---|" + "---|" * len(METRICS),
@@ -434,16 +650,31 @@ def write_report(rows: list[dict], stats_counter: dict, output_path: Path) -> No
         lines.append(f"| {mode} | " + " | ".join(row_vals) + f" | *(/{n_total})*")
 
     lines += [
+        "\n## Couverture — momentum, streak, qualité d'adversaire (côté gagnant)",
+        "| Feature | Lignes disponibles |",
+        "|---|---|",
+    ]
+    for metric in MOMENTUM_METRICS:
+        lines.append(f"| momentum_{metric} | {coverage_field(f'momentum_{metric}')} / {n_total} |")
+    lines += [
+        f"| streak | {n_total} / {n_total} *(toujours renseigné, 0 par défaut sans historique)* |",
+        f"| r10_avg_opp_elo_beaten | {coverage_field('r10_avg_opp_elo_beaten')} / {n_total} |",
+        f"| r10_upset_win_pct | {coverage_field('r10_upset_win_pct')} / {n_total} |",
+        f"| r10_bad_loss_pct | {coverage_field('r10_bad_loss_pct')} / {n_total} |",
+        f"| quality_ema | {coverage_field('quality_ema')} / {n_total} |",
+    ]
+
+    lines += [
         "\n## Détail des modes de lissage",
     ]
     for mode, desc in modes:
-        n_avail = coverage(mode, "srv_1st_pct")
+        n_avail = coverage(mode, "srv_1st_pct") if mode != "delta_form" else coverage_field("delta_form_srv_1st_pct")
         lines.append(f"- **{mode}** ({desc}) : {n_avail} / {n_total} lignes disponibles (côté gagnant, "
                       f"référence sur `srv_1st_pct` — les autres métriques peuvent différer légèrement, "
                       f"voir tableau ci-dessus, notamment `hold_pct`/`break_pct` à cause de `SvGms`).")
 
     lines += [
-        "\n## Colonnes ajoutées (préfixe `w_`/`l_`, pour chacun des 3 modes `r10_`/`hard12mo_`/`ema_`)",
+        "\n## Colonnes ajoutées (préfixe `w_`/`l_`, pour chacun des modes `r10_`/`hard12mo_`/`ema_`/`ema_long_`/`delta_form_`)",
         "- `*_n` : nombre de matchs pris en compte dans la fenêtre/l'EMA",
         "- `*_srv_1st_pct`, `*_srv_2nd_pct`, `*_srv_bp_saved` : performance au service",
         "- `*_ret_pts_pct`, `*_ret_bp_conv` : performance au retour",
@@ -452,8 +683,21 @@ def write_report(rows: list[dict], stats_counter: dict, output_path: Path) -> No
         "- `*_dominance_ratio` : % retour gagné / % service perdu — > 1.0 = domine l'échange de points",
         "- `*_pressure_rating` : `srv_bp_saved + ret_bp_conv`, proxy de solidité sur balle de break "
         "(ne capture pas spécifiquement les tie-breaks, donnée indisponible à ce niveau)",
+        "\n## Colonnes ajoutées — momentum / qualité d'adversaire (Étape 4bis, préfixe `w_`/`l_`)",
+        "- `momentum_dominance_ratio`, `momentum_hold_pct` : pente intra-fenêtre r10 "
+        "(moyenne 2e moitié - moyenne 1re moitié). Positif = en progression sur cette métrique.",
+        "- `delta_form_*` : EMA courte - EMA longue, pour chacune des 9 métriques. Positif = "
+        "le joueur performe actuellement au-dessus de son niveau de fond récent.",
+        "- `streak` : série de victoires (positif) ou défaites (négatif) consécutives, avant le match.",
+        "- `r10_avg_opp_elo_beaten` : Elo moyen (surface si dispo, sinon global) des adversaires "
+        "battus sur les 10 derniers matchs.",
+        "- `r10_upset_win_pct` : % de ces victoires obtenues contre un adversaire mieux coté.",
+        "- `r10_bad_loss_pct` : % des défaites de la fenêtre concédées contre un adversaire moins bien coté.",
+        "- `quality_ema` / `quality_ema_n` : EMA (et compteur) de la marge d'Elo "
+        "(adversaire - soi-même) sur les seuls matchs GAGNÉS, pondérée par la récence.",
         "\nUne cellule vide signifie : historique insuffisant "
-        f"(< {MIN_HISTORY_FOR_AVERAGE} matchs valides), pas une valeur de zéro.",
+        f"(< {MIN_HISTORY_FOR_AVERAGE} matchs valides, ou < {MIN_HISTORY_FOR_MOMENTUM} pour le momentum), "
+        "pas une valeur de zéro. `streak` fait exception : il vaut 0 par défaut (aucun historique).",
     ]
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -474,8 +718,8 @@ def main(argv: list[str] | None = None) -> int:
     if not input_path.is_absolute():
         input_path = PROCESSED_DIR / input_path.name if "/" not in args.input else Path(args.input)
 
-    print("ÉTAPE 4 — Features de service/retour lissées")
-    
+    print("ÉTAPE 4 — Features de service/retour lissées + momentum/qualité d'adversaire")
+
     if not input_path.exists():
         print(f"✗ {input_path} introuvable. Lance d'abord scripts/build_elo.py "
               f"(avec --k-mode dynamic --suffix _dynamic pour matcher le défaut de ce script).")
@@ -487,13 +731,13 @@ def main(argv: list[str] | None = None) -> int:
 
     enriched_rows, stats_counter = process(matches)
     print(f"→ {stats_counter['n_matches']} matchs traités, "
-          f"{stats_counter['n_missing_serve_stats']} sans stats de service exploitables.")
+          f"{stats_counter['n_missing_serve_stats']} sans stats de service exploitables, "
+          f"{stats_counter['n_missing_elo_for_quality']} sans Elo complet pour la qualité d'adversaire.")
 
     write_output(enriched_rows, OUTPUT_FILE)
     print(f"→ Fichier enrichi écrit : {OUTPUT_FILE}")
 
     write_report(enriched_rows, stats_counter, OUTPUT_REPORT_FILE)
-
 
     return 0
 
