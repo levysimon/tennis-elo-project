@@ -34,7 +34,7 @@ These rules exist specifically to avoid the most common failure mode in this kin
 ## Pipeline
 
 1. **Collection** — download yearly ATP CSVs (2000–2026), verify row counts / expected columns, document missing-value rates per column/year.
-2. **Cleaning** — concatenate, sort by date, normalize player IDs, ?? filter to hard-court matches?? vraiment ? 
+2. **Cleaning** — concatenate, sort by date, normalize player IDs.
 3. **Merge maths and odds** — one row per match, symmetrized as player1/player2 to avoid systematically encoding the winner first; odds merged by player-pair + year.
 4. **Elo** — global and surface-specific Elo, computed match-by-match in chronological order.
 5. **Serve/return features** — 1st/2nd serve win rates, break-point conversion/save rates, rolling averages (last 10 matches, last 12 months, exponential mobile average).

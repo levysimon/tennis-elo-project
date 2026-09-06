@@ -24,6 +24,17 @@ CHANGEMENTS PAR RAPPORT A LA V2 :
    COMPLÈTE (plus de head(50)), et une liste séparée des features JAMAIS
    utilisées dans un split (gain nul, absentes de model.get_score()) - les
    deux causes de "feature absente du tableau" étaient confondues avant.
+5. Ajout d'une 3e baseline : le CLASSEMENT ATP BRUT (player{1,2}_rank et
+   player{1,2}_rank_points), en plus de la baseline Elo — conformément au
+   principe #5 du README ("Le Elo seul, ou même le classement ATP brut,
+   doit servir de référence"). Construite en miroir de la baseline Elo :
+   régression logistique sur 2 features (écart de rang, écart de points
+   ATP), même traitement des NaN (joueurs non classés -> rang très bas
+   fictif, points = 0, cf. RANK_UNRANKED_FALLBACK ci-dessous).
+   NB : ce dataset est déjà exclusivement composé de matchs ATP Tour (cf.
+   README section 2 — pas de Challenger/ITF mélangé), donc aucun filtrage
+   supplémentaire n'est nécessaire pour isoler "l'ATP" : c'est déjà le cas
+   sur l'ensemble du fichier.
 """
 
 from __future__ import annotations
@@ -41,6 +52,14 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs" / "analyse xgboost"
 DATA_START = "2000-01-01"
 TEST_ORIGINS = ["2022-01-01", "2023-01-01", "2024-01-01", "2025-01-01"]
 TEST_WINDOW_END = "2026-12-31"
+
+# Valeur fictive utilisée pour un joueur NON CLASSÉ (wildcard, retour de
+# blessure, etc.) : un rang très mauvais plutôt qu'un NaN, pour ne pas
+# fausser l'écart de rang. 2000 est bien au-delà de tout rang ATP réaliste
+# rencontré dans ce dataset (le rang le plus faible représenté reste très
+# inférieur à ce seuil), donc un joueur non classé est toujours traité
+# comme "beaucoup plus faible" que n'importe quel adversaire classé.
+RANK_UNRANKED_FALLBACK = 2000.0
 
 # --- Colonnes de cotes de bookmaker : EXCLUSION PAR NOM EXACT (cf. modeling.py) ---
 BOOKMAKER_SUFFIXES = ('b365', 'ps', 'ex', 'max', 'avg')
@@ -138,9 +157,45 @@ def train_and_eval_one_origin(df, cutoff, feature_cols):
             "brier": brier_score_loss(y_test, proba_elo),
         }
 
+    # --- Baseline "classement ATP brut" (principe #5 du README) ---------
+    # Miroir exact de la baseline Elo : régression logistique sur 2 features
+    # (écart de rang, écart de points ATP). Rang manquant (non classé) ->
+    # RANK_UNRANKED_FALLBACK plutôt que 0, car 0 serait interprété comme
+    # "meilleur rang possible" (rang #0), soit l'inverse de la réalité.
+    # Points manquants -> 0, qui est ici la valeur réelle d'un joueur sans
+    # point ATP (contrairement au rang, l'absence de points ATP vaut
+    # littéralement 0 point).
+    rank_metrics = None
+    needed_rank = ["player1_rank", "player2_rank", "player1_rank_points", "player2_rank_points"]
+    if all(c in df.columns for c in needed_rank):
+        train_rank_p1 = train["player1_rank"].fillna(RANK_UNRANKED_FALLBACK)
+        train_rank_p2 = train["player2_rank"].fillna(RANK_UNRANKED_FALLBACK)
+        test_rank_p1 = test["player1_rank"].fillna(RANK_UNRANKED_FALLBACK)
+        test_rank_p2 = test["player2_rank"].fillna(RANK_UNRANKED_FALLBACK)
+
+        # Signe cohérent avec l'Elo : positif = player1 mieux classé/avantagé.
+        # Rang : un rang NUMÉRIQUEMENT plus petit est MEILLEUR, donc on
+        # inverse (player2_rank - player1_rank) pour que "positif" signifie
+        # bien "player1 avantagé", comme pour elo_diff.
+        train_rank_diff = (train_rank_p2 - train_rank_p1)
+        test_rank_diff = (test_rank_p2 - test_rank_p1)
+        train_points_diff = (train["player1_rank_points"] - train["player2_rank_points"]).fillna(0)
+        test_points_diff = (test["player1_rank_points"] - test["player2_rank_points"]).fillna(0)
+
+        X_train_rank = np.column_stack([train_rank_diff, train_points_diff])
+        X_test_rank = np.column_stack([test_rank_diff, test_points_diff])
+        clf_rank = LogisticRegression()
+        clf_rank.fit(X_train_rank, train["target_player1_won"])
+        proba_rank = clf_rank.predict_proba(X_test_rank)[:, 1]
+        rank_metrics = {
+            "accuracy": accuracy_score(y_test, proba_rank > 0.5),
+            "log_loss": log_loss(y_test, proba_rank),
+            "brier": brier_score_loss(y_test, proba_rank),
+        }
+
     return {
         "cutoff": cutoff, "n_train": len(train), "n_test": len(test),
-        "full": full_metrics, "elo": elo_metrics,
+        "full": full_metrics, "elo": elo_metrics, "rank": rank_metrics,
     }
 
 
@@ -214,9 +269,11 @@ def main():
         per_origin_results.append(res)
         acc_full = res["full"]["accuracy"]
         acc_elo = res["elo"]["accuracy"] if res["elo"] else float("nan")
+        acc_rank = res["rank"]["accuracy"] if res["rank"] else float("nan")
         print(f"     n_train={res['n_train']}, n_test={res['n_test']}, "
               f"accuracy modèle={acc_full:.4f}, accuracy Elo={acc_elo:.4f}, "
-              f"gain={acc_full - acc_elo:+.4f}")
+              f"accuracy Rang ATP={acc_rank:.4f}, "
+              f"gain vs Elo={acc_full - acc_elo:+.4f}, gain vs Rang={acc_full - acc_rank:+.4f}")
 
     if not per_origin_results:
         print("✗ Aucune origine n'a produit de résultat exploitable.")
